@@ -161,10 +161,6 @@ if __name__ == "__main__":
         {"capacity":600, "shift_time":480},
     ]
 
-    # ----------------------------
-    # RUN PIPELINE
-    # ----------------------------
-
     G = build_road_graph("Hyderabad, India")
     clusters = cluster_gvps(gvps, k=2)
 
