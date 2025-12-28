@@ -1,17 +1,3 @@
-# ============================================================
-# CITY-SCALE WASTE COLLECTION ROUTING SYSTEM
-# ============================================================
-# Features:
-# - K-Means clustering of GVPs
-# - Multiple SCTPs
-# - Real road travel time using OpenStreetMap (OSM)
-# - Multiple vehicles per cluster
-# - Capacity constraints
-# - Shift duration (working hours)
-# - Time windows at GVPs
-# - Google OR-Tools (VRPTW)
-# ============================================================
-
 import math
 import numpy as np
 import osmnx as ox
@@ -19,9 +5,6 @@ import networkx as nx
 from sklearn.cluster import KMeans
 from ortools.constraint_solver import pywrapcp, routing_enums_pb2
 
-# ============================================================
-# BUILD ROAD NETWORK (ONCE PER CITY)
-# ============================================================
 
 def build_road_graph(city="Hyderabad, India"):
     G = ox.graph_from_place(city, network_type="drive")
@@ -29,18 +12,10 @@ def build_road_graph(city="Hyderabad, India"):
     G = ox.add_edge_travel_times(G)
     return G
 
-# ============================================================
-# REAL ROAD TRAVEL TIME (SECONDS)
-# ============================================================
-
 def road_travel_time(G, lat1, lon1, lat2, lon2):
     orig = ox.nearest_nodes(G, lon1, lat1)
     dest = ox.nearest_nodes(G, lon2, lat2)
     return nx.shortest_path_length(G, orig, dest, weight="travel_time")
-
-# ============================================================
-# K-MEANS CLUSTERING OF GVPs
-# ============================================================
 
 def cluster_gvps(gvps, k):
     coords = np.array([[g["lat"], g["lon"]] for g in gvps])
@@ -50,10 +25,6 @@ def cluster_gvps(gvps, k):
     for i, label in enumerate(labels):
         clusters.setdefault(label, []).append(gvps[i])
     return clusters
-
-# ============================================================
-# ASSIGN NEAREST SCTP TO CLUSTER
-# ============================================================
 
 def assign_sctp(cluster, sctps):
     clat = sum(g["lat"] for g in cluster) / len(cluster)
@@ -68,10 +39,6 @@ def assign_sctp(cluster, sctps):
         return 2 * R * math.asin(math.sqrt(a))
 
     return min(sctps, key=lambda s: hav(clat, clon, s["lat"], s["lon"]))
-
-# ============================================================
-# CREATE OR-TOOLS DATA MODEL (VRPTW)
-# ============================================================
 
 def create_cluster_data(cluster, sctp, vehicles, G):
     locations = [(sctp["lat"], sctp["lon"])]
@@ -100,10 +67,6 @@ def create_cluster_data(cluster, sctp, vehicles, G):
         "num_vehicles": len(vehicles),
         "depot": 0
     }
-
-# ============================================================
-# SOLVE VRPTW USING OR-TOOLS
-# ============================================================
 
 def solve_vrptw(data):
     manager = pywrapcp.RoutingIndexManager(
@@ -158,10 +121,6 @@ def solve_vrptw(data):
     solution = routing.SolveWithParameters(params)
     return routing, manager, solution
 
-# ============================================================
-# EXTRACT ROUTES
-# ============================================================
-
 def extract_routes(routing, manager, solution):
     routes = {}
     if not solution:
@@ -177,10 +136,6 @@ def extract_routes(routing, manager, solution):
         routes[v] = route
 
     return routes
-
-# ============================================================
-# MAIN EXECUTION PIPELINE
-# ============================================================
 
 if __name__ == "__main__":
 
