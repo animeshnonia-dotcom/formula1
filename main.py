@@ -1,175 +1,177 @@
-import math
-import numpy as np
-import osmnx as ox
-import networkx as nx
-from sklearn.cluster import KMeans
-from ortools.constraint_solver import pywrapcp, routing_enums_pb2
+# app.py
+# -----------------------------------------------------
+# SMART WASTE COLLECTION ROUTING SYSTEM – WEB (CSV UPLOAD)
+# -----------------------------------------------------
+# Run:
+#   pip install flask pandas folium requests
+#   python app.py
+# Open:
+#   http://127.0.0.1:5000
+
+from flask import Flask, render_template_string, request
+import math, heapq, folium, pandas as pd, requests
+from folium.plugins import AntPath
+
+app = Flask(__name__)
+
+# ------------------ CORE LOGIC (UNCHANGED) ------------------
+
+def haversine(a, b):
+    R = 6371
+    lat1, lon1 = a
+    lat2, lon2 = b
+    dlat = math.radians(lat2 - lat1)
+    dlon = math.radians(lon2 - lon1)
+    h = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * \
+        math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
+    return 2 * R * math.asin(math.sqrt(h))
+
+TRAFFIC = {
+    "1": {"peak": 1.4, "off": 1.0},
+    "2": {"peak": 2.0, "off": 1.2},
+    "3": {"peak": 2.8, "off": 1.6}
+}
+
+def traffic_factor(minute, cfg):
+    hour = minute // 60
+    if 7 <= hour <= 10 or 17 <= hour <= 20:
+        return cfg["peak"]
+    return cfg["off"]
 
 
-def build_road_graph(city="Hyderabad, India"):
-    G = ox.graph_from_place(city, network_type="drive")
-    G = ox.add_edge_speeds(G)
-    G = ox.add_edge_travel_times(G)
-    return G
+def travel_time(a, b, start, cfg):
+    speed = 30
+    base = (haversine(a, b) / speed) * 60
+    return base * traffic_factor(start, cfg)
 
-def road_travel_time(G, lat1, lon1, lat2, lon2):
-    orig = ox.nearest_nodes(G, lon1, lat1)
-    dest = ox.nearest_nodes(G, lon2, lat2)
-    return nx.shortest_path_length(G, orig, dest, weight="travel_time")
 
-def cluster_gvps(gvps, k):
-    coords = np.array([[g["lat"], g["lon"]] for g in gvps])
-    labels = KMeans(n_clusters=k, random_state=42).fit_predict(coords)
+def road_path(a, b):
+    url = f"http://router.project-osrm.org/route/v1/driving/{a[1]},{a[0]};{b[1]},{b[0]}?overview=full&geometries=geojson"
+    try:
+        r = requests.get(url, timeout=5)
+        coords = r.json()["routes"][0]["geometry"]["coordinates"]
+        return [(lat, lon) for lon, lat in coords]
+    except:
+        return [a, b]
 
-    clusters = {}
-    for i, label in enumerate(labels):
-        clusters.setdefault(label, []).append(gvps[i])
-    return clusters
 
-def assign_sctp(cluster, sctps):
-    clat = sum(g["lat"] for g in cluster) / len(cluster)
-    clon = sum(g["lon"] for g in cluster) / len(cluster)
+def dijkstra(start, end, nodes, start_time, cfg):
+    pq = [(0, start, [start])]
+    visited = set()
+    while pq:
+        cost, u, path = heapq.heappop(pq)
+        if u == end:
+            return path, cost
+        if u in visited:
+            continue
+        visited.add(u)
+        for v in nodes:
+            if v != u and v not in visited:
+                t = travel_time(u, v, start_time + cost, cfg)
+                heapq.heappush(pq, (cost + t, v, path + [v]))
+    return [], float("inf")
 
-    def hav(lat1, lon1, lat2, lon2):
-        R = 6371
-        lat1, lon1, lat2, lon2 = map(math.radians, [lat1, lon1, lat2, lon2])
-        dlat = lat2 - lat1
-        dlon = lon2 - lon1
-        a = math.sin(dlat/2)**2 + math.cos(lat1)*math.cos(lat2)*math.sin(dlon/2)**2
-        return 2 * R * math.asin(math.sqrt(a))
 
-    return min(sctps, key=lambda s: hav(clat, clon, s["lat"], s["lon"]))
+def build_routes(sctps, gvps, vehicles, capacity, traffic_cfg):
+    for g in gvps:
+        g["sctp"] = min(range(len(sctps)), key=lambda i: haversine(g["coord"], sctps[i]["coord"]))
 
-def create_cluster_data(cluster, sctp, vehicles, G):
-    locations = [(sctp["lat"], sctp["lon"])]
-    demands = [0]
-    time_windows = [(0, vehicles[0]["shift_time"])]
+    m = folium.Map(location=sctps[0]["coord"], zoom_start=12)
 
-    for g in cluster:
-        locations.append((g["lat"], g["lon"]))
-        demands.append(g["waste"])
-        time_windows.append(g["time_window"])
+    for s in sctps:
+        folium.Marker(s["coord"], popup=s["name"], icon=folium.Icon(color="blue")).add_to(m)
+    for g in gvps:
+        folium.CircleMarker(g["coord"], radius=4, color="red", fill=True).add_to(m)
 
-    time_matrix = []
-    for a in locations:
-        row = []
-        for b in locations:
-            t = road_travel_time(G, a[0], a[1], b[0], b[1])
-            row.append(int(t / 60))  # minutes
-        time_matrix.append(row)
+    colors = ["green", "purple", "orange", "black", "darkred"]
 
-    return {
-        "time_matrix": time_matrix,
-        "demands": demands,
-        "time_windows": time_windows,
-        "vehicle_capacities": [v["capacity"] for v in vehicles],
-        "shift_time": vehicles[0]["shift_time"],
-        "num_vehicles": len(vehicles),
-        "depot": 0
-    }
+    for i, sctp in enumerate(sctps):
+        depot = sctp["coord"]
+        points = [g for g in gvps if g["sctp"] == i]
+        nodes = [depot] + [g["coord"] for g in points]
+        routes = [{"path": [depot], "pos": depot, "time": 480, "load": 0} for _ in range(vehicles)]
 
-def solve_vrptw(data):
-    manager = pywrapcp.RoutingIndexManager(
-        len(data["time_matrix"]),
-        data["num_vehicles"],
-        data["depot"]
-    )
+        for g in points:
+            for r in routes:
+                if r["load"] + g["waste"] <= capacity:
+                    path, cost = dijkstra(r["pos"], g["coord"], nodes, r["time"], traffic_cfg)
+                    r["path"].extend(path[1:])
+                    r["pos"] = g["coord"]
+                    r["time"] += cost
+                    r["load"] += g["waste"]
+                    break
 
-    routing = pywrapcp.RoutingModel(manager)
+        for idx, r in enumerate(routes):
+            r["path"].append(depot)
+            road = []
+            for j in range(len(r["path"]) - 1):
+                road.extend(road_path(r["path"][j], r["path"][j + 1]))
+            AntPath(road, color=colors[idx % len(colors)], weight=4, tooltip=f"Vehicle {idx+1}").add_to(m)
 
-    def time_cb(i, j):
-        return data["time_matrix"][
-            manager.IndexToNode(i)
-        ][
-            manager.IndexToNode(j)
-        ]
+    return m
 
-    transit = routing.RegisterTransitCallback(time_cb)
-    routing.SetArcCostEvaluatorOfAllVehicles(transit)
+# ------------------ WEB UI ------------------
 
-    def demand_cb(i):
-        return data["demands"][manager.IndexToNode(i)]
+HTML = """
+<!doctype html>
+<html>
+<head>
+<title>Smart Waste Routing (CSV Upload)</title>
+<style>
+body{font-family:Arial;background:#f4f6f8;padding:40px}
+.box{background:white;padding:25px;border-radius:8px;max-width:600px}
+input,select{width:100%;padding:8px;margin:8px 0}
+button{padding:10px 20px;background:#0b5ed7;color:white;border:none}
+</style>
+</head>
+<body>
+<h2>Smart Waste Collection Routing System</h2>
+<div class="box">
+<form method="post" enctype="multipart/form-data">
 
-    demand = routing.RegisterUnaryTransitCallback(demand_cb)
+<label>Traffic Scenario</label>
+<select name="traffic">
+<option value="1">Normal</option>
+<option value="2">Peak</option>
+<option value="3">Festival</option>
+</select>
 
-    routing.AddDimensionWithVehicleCapacity(
-        demand, 0, data["vehicle_capacities"], True, "Capacity"
-    )
+<label>SCTP CSV (name,lat,lon)</label>
+<input type="file" name="sctp" required>
 
-    routing.AddDimension(
-        transit,
-        30,
-        data["shift_time"],
-        False,
-        "Time"
-    )
+<label>GVP CSV (lat,lon,waste,tw_start,tw_end)</label>
+<input type="file" name="gvp" required>
 
-    time_dim = routing.GetDimensionOrDie("Time")
+<label>Config CSV (vehicles,capacity)</label>
+<input type="file" name="config" required>
 
-    for node, window in enumerate(data["time_windows"]):
-        index = manager.NodeToIndex(node)
-        time_dim.CumulVar(index).SetRange(window[0], window[1])
+<button type="submit">Generate Routes</button>
+</form>
+</div>
+</body>
+</html>
+"""
 
-    for v in range(data["num_vehicles"]):
-        time_dim.CumulVar(routing.End(v)).SetRange(0, data["shift_time"])
+@app.route('/', methods=['GET', 'POST'])
+def index():
+    if request.method == 'POST':
+        traffic_cfg = TRAFFIC[request.form['traffic']]
 
-    params = pywrapcp.DefaultRoutingSearchParameters()
-    params.first_solution_strategy = routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC
-    params.local_search_metaheuristic = routing_enums_pb2.LocalSearchMetaheuristic.GUIDED_LOCAL_SEARCH
-    params.time_limit.seconds = 15
+        sctp_df = pd.read_csv(request.files['sctp'])
+        gvp_df = pd.read_csv(request.files['gvp'])
+        cfg = pd.read_csv(request.files['config']).iloc[0]
 
-    solution = routing.SolveWithParameters(params)
-    return routing, manager, solution
+        sctps = [{"name": r.name, "coord": (r.lat, r.lon)} for _, r in sctp_df.iterrows()]
+        gvps = [{
+            "coord": (r.lat, r.lon),
+            "waste": r.waste,
+            "tw": (r.tw_start * 60, r.tw_end * 60)
+        } for _, r in gvp_df.iterrows()]
 
-def extract_routes(routing, manager, solution):
-    routes = {}
-    if not solution:
-        return routes
+        fmap = build_routes(sctps, gvps, int(cfg.vehicles), int(cfg.capacity), traffic_cfg)
+        return fmap._repr_html_()
 
-    for v in range(routing.vehicles()):
-        index = routing.Start(v)
-        route = []
-        while not routing.IsEnd(index):
-            route.append(manager.IndexToNode(index))
-            index = solution.Value(routing.NextVar(index))
-        route.append(manager.IndexToNode(index))
-        routes[v] = route
+    return render_template_string(HTML)
 
-    return routes
-
-if __name__ == "__main__":
-
-    # ----------------------------
-    # INPUT DATA
-    # ----------------------------
-
-    gvps = [
-        {"lat":17.385, "lon":78.4867, "waste":300, "time_window":(0,240)},
-        {"lat":17.39,  "lon":78.49,   "waste":200, "time_window":(120,360)},
-        {"lat":17.38,  "lon":78.48,   "waste":150, "time_window":(0,480)},
-        {"lat":17.37,  "lon":78.47,   "waste":180, "time_window":(60,300)},
-        {"lat":17.41,  "lon":78.51,   "waste":220, "time_window":(0,480)},
-    ]
-
-    sctps = [
-        {"lat":17.40, "lon":78.50},
-        {"lat":17.36, "lon":78.46},
-    ]
-
-    vehicles = [
-        {"capacity":600, "shift_time":480},
-        {"capacity":600, "shift_time":480},
-    ]
-
-    G = build_road_graph("Hyderabad, India")
-    clusters = cluster_gvps(gvps, k=2)
-
-    for cid, cluster in clusters.items():
-        sctp = assign_sctp(cluster, sctps)
-        data = create_cluster_data(cluster, sctp, vehicles, G)
-        routing, manager, solution = solve_vrptw(data)
-        routes = extract_routes(routing, manager, solution)
-
-        print(f"\nCluster {cid} | Assigned SCTP: {sctp}")
-        for v, r in routes.items():
-            print(f" Vehicle {v}: {r}")
+if __name__ == '__main__':
+    app.run(debug=True)
